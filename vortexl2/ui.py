@@ -53,8 +53,17 @@ def show_banner(config: Config):
     # Get server IP
     server_ip = config.get_local_ip() or "Not configured"
     
+    console.print(banner_text)
+    
+    # Contact info bar
+    console.print(Panel(
+        f"[bold white]Telegram:[/] [cyan]@iliyadevsh[/]  |  [bold white]Version:[/] [red]{__version__}[/]  |  [bold white]GitHub:[/] [cyan]github.com/iliya-Developer[/]",
+        border_style="white",
+        box=box.ROUNDED
+    ))
+    
+    # Server info
     info_lines = [
-        f"[bold white]Version:[/] [cyan]{__version__}[/]",
         f"[bold white]Server IP:[/] [yellow]{server_ip}[/]",
         f"[bold white]Role:[/] [{role_color}]{role}[/]",
     ]
