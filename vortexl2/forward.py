@@ -2,6 +2,7 @@
 VortexL2 Port Forward Management
 
 Handles socat-based TCP port forwarding with systemd service management.
+Each port forward gets its own service file with the correct remote IP.
 """
 
 import os
@@ -11,15 +12,16 @@ from typing import List, Tuple, Dict, Optional
 
 
 SYSTEMD_DIR = Path("/etc/systemd/system")
-SERVICE_PREFIX = "vortexl2-forward@"
-FORWARD_TEMPLATE = """[Unit]
-Description=VortexL2 Port Forward - Port %i
-After=network.target vortexl2-tunnel.service
+
+# Service file template - one per port (not a systemd template anymore)
+SERVICE_TEMPLATE = """[Unit]
+Description=VortexL2 Port Forward - Port {port}
+After=network.target
 Requires=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/socat TCP4-LISTEN:%i,reuseaddr,fork TCP4:{remote_ip}:%i
+ExecStart=/usr/bin/socat TCP4-LISTEN:{port},reuseaddr,fork TCP4:{remote_ip}:{port}
 Restart=always
 RestartSec=5
 
@@ -52,64 +54,58 @@ class ForwardManager:
     
     def _get_service_name(self, port: int) -> str:
         """Get systemd service name for a port."""
-        return f"{SERVICE_PREFIX}{port}.service"
+        return f"vortexl2-fwd-{port}.service"
     
-    def _get_template_path(self) -> Path:
-        """Get path to the template unit file."""
-        return SYSTEMD_DIR / f"{SERVICE_PREFIX}.service"
+    def _get_service_path(self, port: int) -> Path:
+        """Get path to the service file for a port."""
+        return SYSTEMD_DIR / self._get_service_name(port)
     
-    def install_template(self) -> Tuple[bool, str]:
-        """Install the systemd template unit for port forwards."""
+    def create_forward(self, port: int) -> Tuple[bool, str]:
+        """Create and start a port forward service."""
         remote_ip = self.config.remote_forward_ip
         if not remote_ip:
             return False, "Remote forward IP not configured"
         
-        template_path = self._get_template_path()
-        template_content = FORWARD_TEMPLATE.format(remote_ip=remote_ip)
+        service_path = self._get_service_path(port)
+        service_name = self._get_service_name(port)
+        
+        # Create service file with correct remote IP
+        service_content = SERVICE_TEMPLATE.format(port=port, remote_ip=remote_ip)
         
         try:
-            with open(template_path, 'w') as f:
-                f.write(template_content)
-            
-            # Reload systemd
-            run_command("systemctl daemon-reload")
-            return True, f"Template installed at {template_path}"
+            with open(service_path, 'w') as f:
+                f.write(service_content)
         except Exception as e:
-            return False, f"Failed to install template: {e}"
-    
-    def update_template(self, remote_ip: str = None) -> Tuple[bool, str]:
-        """Update the template with new remote IP."""
-        if remote_ip:
-            self.config.remote_forward_ip = remote_ip
-        return self.install_template()
-    
-    def create_forward(self, port: int) -> Tuple[bool, str]:
-        """Create and start a port forward service."""
-        # Ensure template exists
-        if not self._get_template_path().exists():
-            success, msg = self.install_template()
-            if not success:
-                return False, f"Failed to install template: {msg}"
+            return False, f"Failed to create service file: {e}"
         
-        service_name = self._get_service_name(port)
+        # Reload systemd
+        run_command("systemctl daemon-reload")
         
         # Enable and start the service
         success, output = run_command(f"systemctl enable --now {service_name}")
         if not success:
-            return False, f"Failed to create forward for port {port}: {output}"
+            return False, f"Failed to start forward for port {port}: {output}"
         
         # Add to config
         self.config.add_port(port)
         
-        return True, f"Port forward for {port} created and started"
+        return True, f"Port forward for {port} created (-> {remote_ip}:{port})"
     
     def remove_forward(self, port: int) -> Tuple[bool, str]:
-        """Stop and disable a port forward service."""
+        """Stop, disable and remove a port forward service."""
         service_name = self._get_service_name(port)
+        service_path = self._get_service_path(port)
         
         # Stop and disable
         run_command(f"systemctl stop {service_name}")
         run_command(f"systemctl disable {service_name}")
+        
+        # Remove service file
+        if service_path.exists():
+            service_path.unlink()
+        
+        # Reload systemd
+        run_command("systemctl daemon-reload")
         
         # Remove from config
         self.config.remove_port(port)
@@ -124,14 +120,10 @@ class ForwardManager:
         for port_str in ports:
             try:
                 port = int(port_str)
-                if port < 1 or port > 65535:
-                    results.append(f"Port {port}: Invalid port number")
-                    continue
-                
                 success, msg = self.create_forward(port)
                 results.append(f"Port {port}: {msg}")
             except ValueError:
-                results.append(f"'{port_str}': Invalid port number")
+                results.append(f"Port '{port_str}': Invalid port number")
         
         return True, "\n".join(results)
     
@@ -146,7 +138,7 @@ class ForwardManager:
                 success, msg = self.remove_forward(port)
                 results.append(f"Port {port}: {msg}")
             except ValueError:
-                results.append(f"'{port_str}': Invalid port number")
+                results.append(f"Port '{port_str}': Invalid port number")
         
         return True, "\n".join(results)
     
@@ -157,17 +149,16 @@ class ForwardManager:
         for port in self.config.forwarded_ports:
             service_name = self._get_service_name(port)
             
-            # Check if service is active
+            # Check service status
             success, output = run_command(f"systemctl is-active {service_name}")
             status = output if success else "inactive"
             
-            # Check if service is enabled
+            # Check if enabled
             success, output = run_command(f"systemctl is-enabled {service_name}")
             enabled = output if success else "disabled"
             
             forwards.append({
                 "port": port,
-                "service": service_name,
                 "status": status,
                 "enabled": enabled,
                 "remote": f"{self.config.remote_forward_ip}:{port}"
@@ -175,34 +166,24 @@ class ForwardManager:
         
         return forwards
     
-    def get_forward_status(self, port: int) -> Dict:
-        """Get detailed status of a specific port forward."""
-        service_name = self._get_service_name(port)
-        
-        success, output = run_command(f"systemctl status {service_name}")
-        
-        return {
-            "port": port,
-            "service": service_name,
-            "detail": output
-        }
-    
-    def restart_forward(self, port: int) -> Tuple[bool, str]:
-        """Restart a specific port forward."""
-        service_name = self._get_service_name(port)
-        success, output = run_command(f"systemctl restart {service_name}")
-        
-        if not success:
-            return False, f"Failed to restart port {port}: {output}"
-        return True, f"Port forward for {port} restarted"
-    
-    def restart_all_forwards(self) -> Tuple[bool, str]:
-        """Restart all configured port forwards."""
+    def start_all_forwards(self) -> Tuple[bool, str]:
+        """Start all configured port forwards."""
         results = []
         
         for port in self.config.forwarded_ports:
-            success, msg = self.restart_forward(port)
-            results.append(f"Port {port}: {msg}")
+            service_name = self._get_service_name(port)
+            service_path = self._get_service_path(port)
+            
+            # If service file doesn't exist, recreate it
+            if not service_path.exists():
+                success, msg = self.create_forward(port)
+                results.append(f"Port {port}: recreated and started")
+            else:
+                success, output = run_command(f"systemctl start {service_name}")
+                if success:
+                    results.append(f"Port {port}: started")
+                else:
+                    results.append(f"Port {port}: failed to start - {output}")
         
         if not results:
             return True, "No port forwards configured"
@@ -210,43 +191,50 @@ class ForwardManager:
         return True, "\n".join(results)
     
     def stop_all_forwards(self) -> Tuple[bool, str]:
-        """Stop all port forward services."""
+        """Stop all configured port forwards."""
         results = []
         
         for port in self.config.forwarded_ports:
             service_name = self._get_service_name(port)
             success, output = run_command(f"systemctl stop {service_name}")
-            status = "stopped" if success else f"failed: {output}"
-            results.append(f"Port {port}: {status}")
+            if success:
+                results.append(f"Port {port}: stopped")
+            else:
+                results.append(f"Port {port}: failed to stop - {output}")
         
         if not results:
             return True, "No port forwards configured"
         
         return True, "\n".join(results)
     
-    def start_all_forwards(self) -> Tuple[bool, str]:
-        """Start all port forward services."""
+    def restart_all_forwards(self) -> Tuple[bool, str]:
+        """Restart all configured port forwards."""
         results = []
         
         for port in self.config.forwarded_ports:
             service_name = self._get_service_name(port)
-            success, output = run_command(f"systemctl start {service_name}")
-            status = "started" if success else f"failed: {output}"
-            results.append(f"Port {port}: {status}")
+            service_path = self._get_service_path(port)
+            
+            # If service file doesn't exist or IP changed, recreate it
+            if not service_path.exists():
+                success, msg = self.create_forward(port)
+                results.append(f"Port {port}: recreated")
+            else:
+                # Update service file with current remote IP
+                remote_ip = self.config.remote_forward_ip
+                service_content = SERVICE_TEMPLATE.format(port=port, remote_ip=remote_ip)
+                
+                with open(service_path, 'w') as f:
+                    f.write(service_content)
+                
+                run_command("systemctl daemon-reload")
+                success, output = run_command(f"systemctl restart {service_name}")
+                if success:
+                    results.append(f"Port {port}: restarted")
+                else:
+                    results.append(f"Port {port}: failed - {output}")
         
         if not results:
             return True, "No port forwards configured"
         
         return True, "\n".join(results)
-    
-    def check_socat_installed(self) -> bool:
-        """Check if socat is installed."""
-        success, _ = run_command("which socat")
-        return success
-    
-    def install_socat(self) -> Tuple[bool, str]:
-        """Install socat package."""
-        success, output = run_command("apt-get install -y socat")
-        if not success:
-            return False, f"Failed to install socat: {output}"
-        return True, "socat installed successfully"
