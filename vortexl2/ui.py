@@ -160,9 +160,9 @@ def show_forwards_menu() -> str:
         ("1", "Add Port Forwards"),
         ("2", "Remove Port Forwards"),
         ("3", "List Port Forwards"),
-        ("4", "Restart All Forwards"),
-        ("5", "Stop All Forwards"),
-        ("6", "Start All Forwards"),
+        ("4", "Re-apply nftables Rules"),
+        ("5", "Remove nftables Rules"),
+        ("6", "Apply nftables Rules"),
         ("0", "Back to Main Menu"),
     ]
     
@@ -173,7 +173,7 @@ def show_forwards_menu() -> str:
     for opt, desc in menu_items:
         table.add_row(f"[{opt}]", desc)
     
-    console.print(Panel(table, title="[bold white]Port Forwards[/]", border_style="green"))
+    console.print(Panel(table, title="[bold white]Port Forwards (nftables)[/]", border_style="green"))
     
     return Prompt.ask("\n[bold cyan]Select option[/]", default="0")
 

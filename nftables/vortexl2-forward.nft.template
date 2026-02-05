@@ -1,0 +1,81 @@
+#!/usr/sbin/nft -f
+# =============================================================================
+# VortexL2 - Kernel-Level TCP+UDP Port Forwarding with nftables
+# =============================================================================
+# Template file - Use setup-nftables.sh to generate the actual config
+# =============================================================================
+
+# Flush existing VortexL2 tables (idempotent reload)
+table inet vortexl2_filter
+delete table inet vortexl2_filter
+
+table ip vortexl2_nat
+delete table ip vortexl2_nat
+
+
+# =============================================================================
+# FILTER TABLE - Stateful Firewall with Secure Defaults
+# =============================================================================
+table inet vortexl2_filter {
+    
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+        
+        # ---- STATEFUL TRACKING ----
+        ct state established,related accept
+        ct state invalid drop
+        
+        # ---- FORWARD RULES FOR PORT RANGE ----
+        tcp dport {{PORT_RANGE}} accept
+        udp dport {{PORT_RANGE}} accept
+        
+        # ---- ICMP for path MTU discovery ----
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+        
+        comment "VortexL2: Secure forward chain"
+    }
+    
+    chain input {
+        type filter hook input priority 0; policy accept;
+        
+        ct state established,related accept
+        ct state invalid drop
+        
+        tcp dport {{PORT_RANGE}} accept
+        udp dport {{PORT_RANGE}} accept
+        
+        comment "VortexL2: Input chain"
+    }
+    
+    chain output {
+        type filter hook output priority 0; policy accept;
+        comment "VortexL2: Output chain"
+    }
+}
+
+
+# =============================================================================
+# NAT TABLE - DNAT + Masquerade
+# =============================================================================
+table ip vortexl2_nat {
+    
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        
+        # DNAT: Forward port range to destination
+        tcp dport {{PORT_RANGE}} dnat to {{DEST_IP}}
+        udp dport {{PORT_RANGE}} dnat to {{DEST_IP}}
+        
+        comment "VortexL2: DNAT"
+    }
+    
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        
+        # Masquerade for return traffic
+        oifname != "lo" masquerade
+        
+        comment "VortexL2: Masquerade"
+    }
+}

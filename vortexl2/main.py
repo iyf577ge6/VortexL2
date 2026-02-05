@@ -35,13 +35,10 @@ def check_root():
         sys.exit(1)
 
 
-def restart_forward_daemon():
-    """Restart the forward daemon service to pick up config changes."""
-    subprocess.run(
-        "systemctl restart vortexl2-forward-daemon",
-        shell=True,
-        capture_output=True
-    )
+def apply_forward_rules(config):
+    """Apply nftables forwarding rules for the tunnel."""
+    forward = ForwardManager(config)
+    return forward.apply_rules()
 
 
 def cmd_apply():
@@ -206,7 +203,13 @@ def handle_forwards_menu(manager: ConfigManager):
     while True:
         ui.show_banner()
         ui.console.print(f"[bold]Managing forwards for tunnel: [magenta]{config.name}[/][/]\n")
-        ui.console.print("[yellow]Note: Forward daemon will manage actual port forwarding[/]\n")
+        
+        # Show status
+        status = forward.get_status()
+        if status["rules_active"]:
+            ui.console.print(f"[green]● nftables rules active[/] | Conntrack: {status['conntrack']}\n")
+        else:
+            ui.console.print("[red]● nftables rules not loaded[/]\n")
         
         # Show current forwards
         forwards = forward.list_forwards()
@@ -218,42 +221,50 @@ def handle_forwards_menu(manager: ConfigManager):
         if choice == "0":
             break
         elif choice == "1":
-            # Add forwards (to config only)
+            # Add forwards
             ports = ui.prompt_ports()
             if ports:
                 success, msg = forward.add_multiple_forwards(ports)
-                ui.show_output(msg, "Add Forwards to Config")
-                # Restart daemon to pick up new ports
-                restart_forward_daemon()
-                ui.show_success("Forwards added. Daemon restarted to apply changes.")
+                ui.show_output(msg, "Add Port Forwards")
+                if success:
+                    ui.show_success("Forwards added and nftables rules applied.")
+                else:
+                    ui.show_error("Failed to add forwards.")
             ui.wait_for_enter()
         elif choice == "2":
-            # Remove forwards (from config)
+            # Remove forwards
             ports = ui.prompt_ports()
             if ports:
                 success, msg = forward.remove_multiple_forwards(ports)
-                ui.show_output(msg, "Remove Forwards from Config")
-                # Restart daemon to apply changes
-                restart_forward_daemon()
-                ui.show_success("Forwards removed. Daemon restarted to apply changes.")
+                ui.show_output(msg, "Remove Port Forwards")
+                if success:
+                    ui.show_success("Forwards removed and nftables rules updated.")
+                else:
+                    ui.show_error("Failed to remove forwards.")
             ui.wait_for_enter()
         elif choice == "3":
             # List forwards (already shown above)
             ui.wait_for_enter()
         elif choice == "4":
-            # Restart daemon
-            restart_forward_daemon()
-            ui.show_success("Forward daemon restarted.")
+            # Re-apply nftables rules
+            success, msg = forward.apply_rules()
+            if success:
+                ui.show_success(f"nftables rules re-applied: {msg}")
+            else:
+                ui.show_error(f"Failed to apply rules: {msg}")
             ui.wait_for_enter()
         elif choice == "5":
-            # Stop daemon
-            subprocess.run("systemctl stop vortexl2-forward-daemon", shell=True)
-            ui.show_success("Forward daemon stopped.")
+            # Remove all nftables rules
+            success, msg = forward.remove_rules()
+            ui.show_success(f"nftables: {msg}")
             ui.wait_for_enter()
         elif choice == "6":
-            # Start daemon
-            subprocess.run("systemctl start vortexl2-forward-daemon", shell=True)
-            ui.show_success("Forward daemon started.")
+            # Apply nftables rules
+            success, msg = forward.apply_rules()
+            if success:
+                ui.show_success(f"nftables rules applied: {msg}")
+            else:
+                ui.show_error(f"Failed to apply rules: {msg}")
             ui.wait_for_enter()
 
 

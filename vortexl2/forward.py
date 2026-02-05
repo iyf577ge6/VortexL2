@@ -1,261 +1,336 @@
 """
 VortexL2 Port Forward Management
 
-Handles asyncio-based TCP port forwarding with better reliability and control.
-Uses pure Python async I/O instead of socat for better error handling and logging.
+Kernel-level TCP+UDP port forwarding using nftables DNAT/masquerade.
+Replaces user-space proxies for high-performance, stable forwarding.
 """
 
 from __future__ import annotations
 
-import asyncio
+import subprocess
 import logging
-import json
+import shutil
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 
-
-# Setup logging
 logger = logging.getLogger(__name__)
 
-# Storage for forward servers
-FORWARDS_STATE_FILE = Path("/var/lib/vortexl2/forwards.json")
-FORWARDS_LOG_DIR = Path("/var/log/vortexl2")
+# nftables config paths
+NFTABLES_DIR = Path("/etc/nftables.d")
+NFTABLES_CONFIG = NFTABLES_DIR / "vortexl2-forward.nft"
+SYSCTL_CONFIG = Path("/etc/sysctl.d/99-vortexl2-forward.conf")
 
 
 @dataclass
-class ForwardSession:
-    """Represents an active port forwarding session."""
+class ForwardRule:
+    """Represents a port forward rule."""
     port: int
     remote_ip: str
     remote_port: int
-    local_reader: Optional[asyncio.StreamReader] = None
-    local_writer: Optional[asyncio.StreamWriter] = None
-    remote_reader: Optional[asyncio.StreamReader] = None
-    remote_writer: Optional[asyncio.StreamWriter] = None
-    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
-    bytes_sent: int = 0
-    bytes_received: int = 0
+    protocol: str = "tcp+udp"
     
     def to_dict(self) -> Dict:
-        """Convert to dictionary for JSON storage."""
-        return {
-            "port": self.port,
-            "remote_ip": self.remote_ip,
-            "remote_port": self.remote_port,
-            "created_at": self.created_at,
-            "bytes_sent": self.bytes_sent,
-            "bytes_received": self.bytes_received,
-        }
-
-
-class ForwardServer:
-    """Manages a single port forward server using asyncio."""
-    
-    def __init__(self, port: int, remote_ip: str, remote_port: int = None):
-        """
-        Initialize forward server.
-        
-        Args:
-            port: Local port to listen on
-            remote_ip: Remote IP to forward to
-            remote_port: Remote port (defaults to same as local port)
-        """
-        self.port = port
-        self.remote_ip = remote_ip
-        self.remote_port = remote_port or port
-        self.server: Optional[asyncio.Server] = None
-        self.active_sessions: List[ForwardSession] = []
-        self.running = False
-        self.stats = {
-            "connections": 0,
-            "total_bytes_sent": 0,
-            "total_bytes_received": 0,
-            "errors": 0,
-        }
-    
-    async def handle_client(self, local_reader: asyncio.StreamReader, 
-                          local_writer: asyncio.StreamWriter):
-        """Handle incoming client connection."""
-        client_addr = local_writer.get_extra_info('peername')
-        session = ForwardSession(
-            port=self.port,
-            remote_ip=self.remote_ip,
-            remote_port=self.remote_port
-        )
-        self.active_sessions.append(session)
-        self.stats["connections"] += 1
-        
-        try:
-            logger.info(f"Client connected from {client_addr} on port {self.port}")
-            
-            # Connect to remote server
-            try:
-                remote_reader, remote_writer = await asyncio.wait_for(
-                    asyncio.open_connection(self.remote_ip, self.remote_port),
-                    timeout=10
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"Timeout connecting to {self.remote_ip}:{self.remote_port}")
-                local_writer.close()
-                await local_writer.wait_closed()
-                self.stats["errors"] += 1
-                return
-            except Exception as e:
-                logger.error(f"Failed to connect to {self.remote_ip}:{self.remote_port}: {e}")
-                local_writer.close()
-                await local_writer.wait_closed()
-                self.stats["errors"] += 1
-                return
-            
-            # Relay data in both directions
-            forward_task = asyncio.create_task(
-                self._relay_data(local_reader, remote_writer, session, "client->remote")
-            )
-            backward_task = asyncio.create_task(
-                self._relay_data(remote_reader, local_writer, session, "remote->client")
-            )
-            
-            # Wait for both tasks to complete
-            await asyncio.gather(forward_task, backward_task)
-            
-        except Exception as e:
-            logger.error(f"Error handling client {client_addr}: {e}")
-            self.stats["errors"] += 1
-        finally:
-            # Cleanup
-            if local_writer:
-                local_writer.close()
-                await local_writer.wait_closed()
-            self.active_sessions.remove(session)
-            logger.info(f"Client {client_addr} disconnected from port {self.port}")
-    
-    async def _relay_data(self, reader: asyncio.StreamReader, 
-                         writer: asyncio.StreamWriter,
-                         session: ForwardSession,
-                         direction: str):
-        """Relay data between two connections."""
-        try:
-            while True:
-                data = await asyncio.wait_for(reader.read(4096), timeout=300)
-                if not data:
-                    break
-                
-                # Update statistics
-                if "client->remote" in direction:
-                    session.bytes_sent += len(data)
-                    self.stats["total_bytes_sent"] += len(data)
-                else:
-                    session.bytes_received += len(data)
-                    self.stats["total_bytes_received"] += len(data)
-                
-                writer.write(data)
-                await writer.drain()
-        except asyncio.TimeoutError:
-            logger.debug(f"Timeout on {direction}")
-        except Exception as e:
-            logger.debug(f"Error relaying {direction}: {e}")
-        finally:
-            writer.close()
-            await writer.wait_closed()
-    
-    async def start(self) -> bool:
-        """Start the forward server."""
-        try:
-            self.server = await asyncio.start_server(
-                self.handle_client,
-                '0.0.0.0',
-                self.port,
-                reuse_address=True
-            )
-            self.running = True
-            logger.info(f"Forward server started on port {self.port} -> {self.remote_ip}:{self.remote_port}")
-            
-            # Start serving
-            async with self.server:
-                await self.server.serve_forever()
-        except OSError as e:
-            logger.error(f"Failed to start server on port {self.port}: {e}")
-            self.running = False
-            return False
-        except Exception as e:
-            logger.error(f"Server error on port {self.port}: {e}")
-            self.running = False
-            return False
-    
-    async def stop(self):
-        """Stop the forward server."""
-        if self.server:
-            self.server.close()
-            await self.server.wait_closed()
-        self.running = False
-        logger.info(f"Forward server stopped on port {self.port}")
-    
-    def get_status(self) -> Dict:
-        """Get server status."""
         return {
             "port": self.port,
             "remote": f"{self.remote_ip}:{self.remote_port}",
-            "running": self.running,
-            "active_sessions": len(self.active_sessions),
-            "stats": self.stats,
+            "protocol": self.protocol,
         }
 
 
 class ForwardManager:
-    """Manages all port forwarding servers."""
+    """
+    Manages kernel-level port forwarding using nftables.
+    
+    Uses DNAT in prerouting and masquerade in postrouting for 
+    high-performance TCP+UDP forwarding without user-space proxies.
+    """
     
     def __init__(self, config):
         self.config = config
-        self.servers: Dict[int, ForwardServer] = {}
-        self.event_loop: Optional[asyncio.AbstractEventLoop] = None
-        self.running_task: Optional[asyncio.Task] = None
-        
-        # Ensure log directory exists
-        FORWARDS_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        self._ensure_dirs()
     
-    def create_forward(self, port: int) -> Tuple[bool, str]:
-        """Create a port forward."""
-        remote_ip = self.config.remote_forward_ip
-        if not remote_ip:
+    def _ensure_dirs(self):
+        """Ensure required directories exist."""
+        NFTABLES_DIR.mkdir(parents=True, exist_ok=True)
+    
+    def _check_nftables(self) -> bool:
+        """Check if nftables is available."""
+        return shutil.which("nft") is not None
+    
+    def _run_cmd(self, cmd: str, check: bool = True) -> Tuple[bool, str]:
+        """Run a shell command."""
+        try:
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            output = result.stdout + result.stderr
+            if check and result.returncode != 0:
+                return False, output.strip()
+            return True, output.strip()
+        except subprocess.TimeoutExpired:
+            return False, "Command timed out"
+        except Exception as e:
+            return False, str(e)
+    
+    def _enable_ip_forward(self) -> Tuple[bool, str]:
+        """Enable IP forwarding in kernel."""
+        try:
+            # Enable immediately
+            Path("/proc/sys/net/ipv4/ip_forward").write_text("1")
+            
+            # Make persistent via sysctl.d
+            sysctl_content = """# VortexL2 - Kernel settings for NAT forwarding
+net.ipv4.ip_forward=1
+net.netfilter.nf_conntrack_max=262144
+net.netfilter.nf_conntrack_tcp_timeout_established=86400
+"""
+            SYSCTL_CONFIG.write_text(sysctl_content)
+            self._run_cmd("sysctl -p /etc/sysctl.d/99-vortexl2-forward.conf", check=False)
+            
+            return True, "IP forwarding enabled"
+        except Exception as e:
+            return False, f"Failed to enable IP forwarding: {e}"
+    
+    def _generate_nftables_config(self, ports: List[int], dest_ip: str) -> str:
+        """Generate nftables configuration for port forwarding."""
+        if not ports:
+            # Empty config - just delete tables
+            return """#!/usr/sbin/nft -f
+# VortexL2 - No ports configured
+table inet vortexl2_filter
+delete table inet vortexl2_filter
+table ip vortexl2_nat  
+delete table ip vortexl2_nat
+"""
+        
+        # Group consecutive ports into ranges for efficiency
+        port_ranges = self._ports_to_ranges(sorted(ports))
+        
+        # Build port match expressions
+        port_expr = ", ".join(port_ranges)
+        
+        config = f"""#!/usr/sbin/nft -f
+# =============================================================================
+# VortexL2 - Kernel-Level TCP+UDP Port Forwarding
+# Destination: {dest_ip} | Ports: {port_expr}
+# =============================================================================
+
+# Flush existing VortexL2 tables
+table inet vortexl2_filter
+delete table inet vortexl2_filter
+
+table ip vortexl2_nat
+delete table ip vortexl2_nat
+
+
+# =============================================================================
+# FILTER TABLE - Stateful Firewall (drop by default in forward)
+# =============================================================================
+table inet vortexl2_filter {{
+    
+    chain forward {{
+        type filter hook forward priority 0; policy drop;
+        
+        # Stateful connection tracking
+        ct state established,related accept
+        ct state invalid drop
+        
+        # Allow forwarded traffic on configured ports
+        tcp dport {{ {port_expr} }} accept
+        udp dport {{ {port_expr} }} accept
+        
+        # ICMP for path MTU discovery
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+    }}
+    
+    chain input {{
+        type filter hook input priority 0; policy accept;
+        
+        ct state established,related accept
+        ct state invalid drop
+        
+        tcp dport {{ {port_expr} }} accept
+        udp dport {{ {port_expr} }} accept
+    }}
+    
+    chain output {{
+        type filter hook output priority 0; policy accept;
+    }}
+}}
+
+
+# =============================================================================
+# NAT TABLE - DNAT + Masquerade
+# =============================================================================
+table ip vortexl2_nat {{
+    
+    chain prerouting {{
+        type nat hook prerouting priority dstnat; policy accept;
+        
+        # DNAT: Forward ports to destination
+        tcp dport {{ {port_expr} }} dnat to {dest_ip}
+        udp dport {{ {port_expr} }} dnat to {dest_ip}
+    }}
+    
+    chain postrouting {{
+        type nat hook postrouting priority srcnat; policy accept;
+        
+        # Masquerade for return path
+        oifname != "lo" masquerade
+    }}
+}}
+"""
+        return config
+    
+    def _ports_to_ranges(self, ports: List[int]) -> List[str]:
+        """Convert list of ports to range expressions (e.g., [80, 81, 82, 443] -> ['80-82', '443'])."""
+        if not ports:
+            return []
+        
+        ranges = []
+        start = ports[0]
+        end = ports[0]
+        
+        for port in ports[1:]:
+            if port == end + 1:
+                end = port
+            else:
+                if start == end:
+                    ranges.append(str(start))
+                else:
+                    ranges.append(f"{start}-{end}")
+                start = port
+                end = port
+        
+        # Add last range
+        if start == end:
+            ranges.append(str(start))
+        else:
+            ranges.append(f"{start}-{end}")
+        
+        return ranges
+    
+    def apply_rules(self) -> Tuple[bool, str]:
+        """Generate and apply nftables rules for current config."""
+        if not self._check_nftables():
+            return False, "nftables not installed. Run: apt install nftables"
+        
+        ports = self.config.forwarded_ports
+        dest_ip = self.config.remote_forward_ip
+        
+        if not dest_ip:
             return False, "Remote forward IP not configured"
         
-        if port in self.servers:
-            return False, f"Port {port} already forwarding"
+        # Enable IP forwarding first
+        success, msg = self._enable_ip_forward()
+        if not success:
+            logger.warning(msg)
         
-        # Create forward server
-        server = ForwardServer(port, remote_ip, remote_port=port)
-        self.servers[port] = server
+        # Generate config
+        nft_config = self._generate_nftables_config(ports, dest_ip)
         
-        # Add to config
+        # Write config file
+        try:
+            NFTABLES_CONFIG.write_text(nft_config)
+        except Exception as e:
+            return False, f"Failed to write config: {e}"
+        
+        # Validate config
+        success, msg = self._run_cmd(f"nft -c -f {NFTABLES_CONFIG}")
+        if not success:
+            return False, f"Config validation failed: {msg}"
+        
+        # Apply config
+        success, msg = self._run_cmd(f"nft -f {NFTABLES_CONFIG}")
+        if not success:
+            return False, f"Failed to apply rules: {msg}"
+        
+        # Ensure nftables service is enabled for persistence
+        self._run_cmd("systemctl enable nftables", check=False)
+        
+        # Add include to main nftables.conf if needed
+        self._ensure_include()
+        
+        port_count = len(ports) if ports else 0
+        return True, f"nftables rules applied ({port_count} ports -> {dest_ip})"
+    
+    def _ensure_include(self):
+        """Ensure our config is included in main nftables.conf."""
+        nftables_conf = Path("/etc/nftables.conf")
+        include_line = f'include "{NFTABLES_CONFIG}"'
+        
+        if nftables_conf.exists():
+            content = nftables_conf.read_text()
+            if include_line not in content:
+                try:
+                    with nftables_conf.open("a") as f:
+                        f.write(f"\n{include_line}\n")
+                except Exception:
+                    pass  # Non-critical
+    
+    def remove_rules(self) -> Tuple[bool, str]:
+        """Remove all VortexL2 nftables rules."""
+        results = []
+        
+        # Delete tables
+        self._run_cmd("nft delete table inet vortexl2_filter", check=False)
+        self._run_cmd("nft delete table ip vortexl2_nat", check=False)
+        results.append("nftables rules removed")
+        
+        # Remove config file
+        if NFTABLES_CONFIG.exists():
+            NFTABLES_CONFIG.unlink()
+            results.append("Config file removed")
+        
+        return True, "; ".join(results)
+    
+    def create_forward(self, port: int) -> Tuple[bool, str]:
+        """Add a port to forwarding config and apply."""
+        if port in self.config.forwarded_ports:
+            return False, f"Port {port} already configured"
+        
         self.config.add_port(port)
-        
-        return True, f"Port forward for {port} created (-> {remote_ip}:{port})"
+        return self.apply_rules()
     
     def remove_forward(self, port: int) -> Tuple[bool, str]:
-        """Remove a port forward."""
-        if port not in self.servers:
+        """Remove a port from forwarding config and apply."""
+        if port not in self.config.forwarded_ports:
             return False, f"Port {port} not found"
         
-        # Server will be stopped when ForwardManager stops or specifically removed
-        del self.servers[port]
         self.config.remove_port(port)
-        
-        return True, f"Port forward for {port} removed"
+        return self.apply_rules()
     
     def add_multiple_forwards(self, ports_str: str) -> Tuple[bool, str]:
         """Add multiple port forwards from comma-separated string."""
         results = []
         ports = [p.strip() for p in ports_str.split(',') if p.strip()]
+        added = []
         
         for port_str in ports:
             try:
                 port = int(port_str)
-                success, msg = self.create_forward(port)
-                results.append(f"Port {port}: {msg}")
+                if port not in self.config.forwarded_ports:
+                    self.config.add_port(port)
+                    added.append(port)
+                    results.append(f"Port {port}: added")
+                else:
+                    results.append(f"Port {port}: already exists")
             except ValueError:
-                results.append(f"Port '{port_str}': Invalid port number")
+                results.append(f"Port '{port_str}': invalid")
+        
+        # Apply all changes at once
+        if added:
+            success, msg = self.apply_rules()
+            if success:
+                results.append(f"\nnftables: {msg}")
+            else:
+                results.append(f"\nnftables error: {msg}")
         
         return True, "\n".join(results)
     
@@ -263,136 +338,106 @@ class ForwardManager:
         """Remove multiple port forwards from comma-separated string."""
         results = []
         ports = [p.strip() for p in ports_str.split(',') if p.strip()]
+        removed = []
         
         for port_str in ports:
             try:
                 port = int(port_str)
-                success, msg = self.remove_forward(port)
-                results.append(f"Port {port}: {msg}")
+                if port in self.config.forwarded_ports:
+                    self.config.remove_port(port)
+                    removed.append(port)
+                    results.append(f"Port {port}: removed")
+                else:
+                    results.append(f"Port {port}: not found")
             except ValueError:
-                results.append(f"Port '{port_str}': Invalid port number")
+                results.append(f"Port '{port_str}': invalid")
+        
+        # Apply all changes at once
+        if removed:
+            success, msg = self.apply_rules()
+            if success:
+                results.append(f"\nnftables: {msg}")
+            else:
+                results.append(f"\nnftables error: {msg}")
         
         return True, "\n".join(results)
     
     def list_forwards(self) -> List[Dict]:
-        """List all configured port forwards with their status."""
+        """List all configured port forwards with status."""
         forwards = []
+        dest_ip = self.config.remote_forward_ip or "not configured"
         
-        # Get actually listening ports from system
-        listening_ports = self._get_listening_ports()
+        # Check if rules are actually loaded
+        rules_active = self._check_rules_active()
         
         for port in self.config.forwarded_ports:
-            is_running = port in listening_ports
-            
-            if port in self.servers:
-                server = self.servers[port]
-                status = server.get_status()
-                status["running"] = is_running  # Override with actual state
-                forwards.append(status)
-            else:
-                forwards.append({
-                    "port": port,
-                    "remote": f"{self.config.remote_forward_ip}:{port}",
-                    "running": is_running,
-                    "active_sessions": 0,
-                })
+            forwards.append({
+                "port": port,
+                "remote": f"{dest_ip}:{port}",
+                "running": rules_active,
+                "active_sessions": self._get_conntrack_count(port) if rules_active else 0,
+            })
         
         return forwards
     
-    def _get_listening_ports(self) -> set:
-        """Get set of ports that are actually listening on the system."""
-        import subprocess
+    def _check_rules_active(self) -> bool:
+        """Check if nftables rules are currently loaded."""
+        success, output = self._run_cmd("nft list table ip vortexl2_nat 2>/dev/null", check=False)
+        return success and "vortexl2_nat" in output
+    
+    def _get_conntrack_count(self, port: int) -> int:
+        """Get active connection count for a port from conntrack."""
         try:
             result = subprocess.run(
-                "ss -tlnp | grep python | grep -oP ':\\K[0-9]+(?=\\s)'",
+                f"conntrack -L -p tcp --dport {port} 2>/dev/null | wc -l",
                 shell=True,
                 capture_output=True,
                 text=True,
                 timeout=5
             )
-            if result.returncode == 0 and result.stdout.strip():
-                ports = set()
-                for line in result.stdout.strip().split('\n'):
-                    try:
-                        ports.add(int(line.strip()))
-                    except ValueError:
-                        pass
-                return ports
+            tcp_count = int(result.stdout.strip()) if result.stdout.strip() else 0
+            
+            result = subprocess.run(
+                f"conntrack -L -p udp --dport {port} 2>/dev/null | wc -l",
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            udp_count = int(result.stdout.strip()) if result.stdout.strip() else 0
+            
+            return tcp_count + udp_count
         except Exception:
-            pass
-        return set()
+            return 0
     
+    def get_status(self) -> Dict:
+        """Get overall forwarding status."""
+        rules_active = self._check_rules_active()
+        
+        # Get conntrack stats
+        try:
+            count = Path("/proc/sys/net/netfilter/nf_conntrack_count").read_text().strip()
+            max_conn = Path("/proc/sys/net/netfilter/nf_conntrack_max").read_text().strip()
+            conntrack = f"{count}/{max_conn}"
+        except Exception:
+            conntrack = "N/A"
+        
+        return {
+            "rules_active": rules_active,
+            "port_count": len(self.config.forwarded_ports),
+            "destination": self.config.remote_forward_ip,
+            "conntrack": conntrack,
+        }
+    
+    # Compatibility methods for existing code
     async def start_all_forwards(self) -> Tuple[bool, str]:
-        """Start all configured port forwards asynchronously."""
-        results = []
-        tasks = []
-        
-        for port in self.config.forwarded_ports:
-            remote_ip = self.config.remote_forward_ip
-            
-            if port not in self.servers:
-                server = ForwardServer(port, remote_ip, remote_port=port)
-                self.servers[port] = server
-            else:
-                server = self.servers[port]
-            
-            if not server.running:
-                task = asyncio.create_task(server.start())
-                tasks.append((port, task))
-                results.append(f"Port {port}: starting...")
-        
-        if not results:
-            return True, "No port forwards configured"
-        
-        return True, "\n".join(results)
+        """Apply nftables rules (async wrapper for compatibility)."""
+        return self.apply_rules()
     
     async def stop_all_forwards(self) -> Tuple[bool, str]:
-        """Stop all configured port forwards asynchronously."""
-        results = []
-        tasks = []
-        
-        for port, server in self.servers.items():
-            if server.running:
-                task = asyncio.create_task(server.stop())
-                tasks.append((port, task))
-                results.append(f"Port {port}: stopping...")
-        
-        # Wait for all tasks
-        if tasks:
-            await asyncio.gather(*[task for _, task in tasks], return_exceptions=True)
-        
-        if not results:
-            return True, "No port forwards running"
-        
-        return True, "\n".join(results)
+        """Remove nftables rules (async wrapper for compatibility)."""
+        return self.remove_rules()
     
     async def restart_all_forwards(self) -> Tuple[bool, str]:
-        """Restart all configured port forwards."""
-        await self.stop_all_forwards()
-        await asyncio.sleep(1)  # Brief pause between stop and start
-        return await self.start_all_forwards()
-    
-    def start_in_background(self) -> bool:
-        """Start all forwards in a background event loop."""
-        try:
-            import threading
-            
-            def run_loop():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                self.event_loop = loop
-                
-                async def run_servers():
-                    await self.start_all_forwards()
-                    # Keep running
-                    while True:
-                        await asyncio.sleep(1)
-                
-                loop.run_until_complete(run_servers())
-            
-            thread = threading.Thread(target=run_loop, daemon=True)
-            thread.start()
-            return True
-        except Exception as e:
-            logger.error(f"Failed to start background forwards: {e}")
-            return False
+        """Re-apply nftables rules (async wrapper for compatibility)."""
+        return self.apply_rules()
