@@ -44,6 +44,18 @@ class ForwardDaemon:
     async def start(self):
         """Start the forward daemon."""
         logger.info("Starting VortexL2 Forward Daemon")
+        
+        # Ensure HAProxy is running before we try to manage it
+        logger.info("Ensuring HAProxy service is running...")
+        result = subprocess.run(
+            "systemctl start haproxy",
+            shell=True,
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            logger.warning(f"Could not ensure HAProxy is running: {result.stderr}")
+        
         self.running = True
         
         # Get all tunnel configurations

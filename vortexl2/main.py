@@ -36,7 +36,18 @@ def check_root():
 
 
 def restart_forward_daemon():
-    """Restart the forward daemon service to pick up config changes."""
+    """Restart the forward daemon service to pick up config changes.
+    
+    Also ensures HAProxy is running before restarting daemon.
+    """
+    # First ensure HAProxy is running
+    subprocess.run(
+        "systemctl start haproxy",
+        shell=True,
+        capture_output=True
+    )
+    
+    # Then restart the forward daemon
     subprocess.run(
         "systemctl restart vortexl2-forward-daemon",
         shell=True,

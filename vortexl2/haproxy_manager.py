@@ -318,23 +318,32 @@ defaults
         return True, "\n".join(results)
     
     def list_forwards(self) -> List[Dict]:
-        """List all configured port forwards with their status."""
+        """List all configured port forwards from all tunnels."""
         forwards = []
         
-        remote_ip = self.config.remote_forward_ip
-        for port in self.config.forwarded_ports:
-            forwards.append({
-                "port": port,
-                "remote": f"{remote_ip}:{port}",
-                "running": self._is_port_listening(port),
-                "active_sessions": 0,
-                "stats": {
-                    "connections": 0,
-                    "total_bytes_sent": 0,
-                    "total_bytes_received": 0,
-                    "errors": 0,
-                }
-            })
+        # Get all tunnels to show all forwards
+        cm = ConfigManager()
+        tunnels = cm.get_all_tunnels()
+        
+        for tunnel in tunnels:
+            remote_ip = getattr(tunnel, 'remote_forward_ip', None)
+            if not remote_ip:
+                continue
+                
+            for port in tunnel.forwarded_ports:
+                forwards.append({
+                    "port": port,
+                    "tunnel": tunnel.name,
+                    "remote": f"{remote_ip}:{port}",
+                    "running": self._is_port_listening(port),
+                    "active_sessions": 0,
+                    "stats": {
+                        "connections": 0,
+                        "total_bytes_sent": 0,
+                        "total_bytes_received": 0,
+                        "errors": 0,
+                    }
+                })
         
         return forwards
     
@@ -352,9 +361,15 @@ defaults
             return False
     
     async def start_all_forwards(self) -> Tuple[bool, str]:
-        """Start all configured port forwards."""
-        if not self.config.forwarded_ports:
-            return True, "No port forwards configured"
+        """Start all configured port forwards from all tunnels."""
+        # Get all tunnels from disk regardless of how manager was initialized
+        cm = ConfigManager()
+        tunnels = cm.get_all_tunnels()
+        
+        # Check if any tunnels have forwarded ports
+        has_forwards = any(t.forwarded_ports for t in tunnels)
+        if not has_forwards:
+            return True, "No port forwards configured across all tunnels"
         
         # Generate and write configuration
         config = self._generate_haproxy_config()
@@ -365,24 +380,37 @@ defaults
         try:
             # First, try to reload if already running
             if Path("/var/run/haproxy.pid").exists():
+                logger.info("HAProxy already running, reloading configuration")
                 if not self._reload_haproxy():
                     return False, "Failed to reload HAProxy"
             else:
-                # Start HAProxy
+                logger.info("Starting HAProxy service")
+                # Start HAProxy with -D flag to daemonize
                 result = subprocess.run(
-                    ["haproxy", "-f", str(HAPROXY_CONFIG_FILE), "-p", "/var/run/haproxy.pid"],
+                    ["haproxy", "-f", str(HAPROXY_CONFIG_FILE), "-p", "/var/run/haproxy.pid", "-D"],
                     capture_output=True,
-                    timeout=10
+                    timeout=10,
+                    text=True
                 )
                 
                 if result.returncode != 0:
-                    return False, f"Failed to start HAProxy: {result.stderr.decode()}"
+                    stderr_msg = result.stderr if result.stderr else "Unknown error"
+                    return False, f"Failed to start HAProxy: {stderr_msg}"
+                
+                logger.info("HAProxy started successfully")
             
             self.running = True
-            ports_str = ", ".join(str(p) for p in self.config.forwarded_ports)
-            return True, f"HAProxy port forwarding started for ports: {ports_str}"
+            # Collect all forwarded ports from all tunnels
+            all_ports = set()
+            for tunnel in tunnels:
+                all_ports.update(tunnel.forwarded_ports)
+            ports_str = ", ".join(sorted(str(p) for p in all_ports))
+            msg = f"HAProxy port forwarding started for ports: {ports_str}" if ports_str else "HAProxy started (no active forwards)"
+            logger.info(msg)
+            return True, msg
             
         except Exception as e:
+            logger.error(f"Exception in start_all_forwards: {e}")
             return False, f"Error starting HAProxy: {e}"
     
     async def stop_all_forwards(self) -> Tuple[bool, str]:
