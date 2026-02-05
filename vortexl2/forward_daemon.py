@@ -1,25 +1,16 @@
-#!/usr/bin/env python3
-"""
-VortexL2 Forward Daemon
-
-Runs the asyncio-based port forwarding servers as a daemon service.
-This replaces the individual socat systemd services.
-"""
-
-from __future__ import annotations
-
 import asyncio
 import logging
 import signal
 import sys
+import subprocess
 from pathlib import Path
 
-# Add parent directory to path
+# Ensure we can import the package
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from vortexl2.config import ConfigManager
+from vortexl2.haproxy_manager import HAProxyManager  # Import HAProxyManager
 from vortexl2.forward import ForwardManager
-
 
 # Setup logging
 logging.basicConfig(
@@ -31,7 +22,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
 
 class ForwardDaemon:
     """Manages the forward daemon."""
@@ -98,7 +88,7 @@ class ForwardDaemon:
         
         logger.info("Forward Daemon stopped")
 
-
+# Main entry point for the forward daemon
 async def main():
     """Main entry point."""
     daemon = ForwardDaemon()

@@ -11,6 +11,8 @@ import argparse
 import subprocess
 import signal
 
+from vortexl2.haproxy_manager import HAProxyManager
+
 # Ensure we can import the package
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -212,15 +214,16 @@ def handle_forwards_menu(manager: ConfigManager):
     if not config:
         return
     
-    forward = ForwardManager(config)
-    
+    # Create HAProxyManager instance for port forwarding
+    haproxy_manager = HAProxyManager(config)
+
     while True:
         ui.show_banner()
         ui.console.print(f"[bold]Managing forwards for tunnel: [magenta]{config.name}[/][/]\n")
         ui.console.print("[yellow]Note: Forward daemon will manage actual port forwarding[/]\n")
         
         # Show current forwards
-        forwards = forward.list_forwards()
+        forwards = haproxy_manager.list_forwards()
         if forwards:
             ui.show_forwards_list(forwards)
         
@@ -232,7 +235,7 @@ def handle_forwards_menu(manager: ConfigManager):
             # Add forwards (to config only)
             ports = ui.prompt_ports()
             if ports:
-                success, msg = forward.add_multiple_forwards(ports)
+                success, msg = haproxy_manager.add_multiple_forwards(ports)
                 ui.show_output(msg, "Add Forwards to Config")
                 # Restart daemon to pick up new ports
                 restart_forward_daemon()
@@ -242,7 +245,7 @@ def handle_forwards_menu(manager: ConfigManager):
             # Remove forwards (from config)
             ports = ui.prompt_ports()
             if ports:
-                success, msg = forward.remove_multiple_forwards(ports)
+                success, msg = haproxy_manager.remove_multiple_forwards(ports)
                 ui.show_output(msg, "Remove Forwards from Config")
                 # Restart daemon to apply changes
                 restart_forward_daemon()
@@ -269,15 +272,13 @@ def handle_forwards_menu(manager: ConfigManager):
         elif choice == "7":
             # Validate and reload HAProxy
             ui.show_info("Validating HAProxy configuration and reloading service...")
-            global_manager = ForwardManager(manager)
-            success, msg = global_manager.validate_and_reload()
+            success, msg = haproxy_manager.validate_and_reload()
             ui.show_output(msg, "HAProxy Validate & Reload")
             if success:
                 ui.show_success("HAProxy reloaded successfully")
             else:
                 ui.show_error(msg)
             ui.wait_for_enter()
-
 
 def handle_logs(manager: ConfigManager):
     """Handle log viewing."""
