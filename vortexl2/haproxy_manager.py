@@ -22,8 +22,10 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 # HAProxy configuration paths
-HAPROXY_CONFIG_DIR = Path("/etc/vortexl2/haproxy")
-HAPROXY_CONFIG_FILE = HAPROXY_CONFIG_DIR / "vortexl2.cfg"
+# Use default HAProxy config path so systemctl reload works
+HAPROXY_CONFIG_DIR = Path("/etc/haproxy")
+HAPROXY_CONFIG_FILE = HAPROXY_CONFIG_DIR / "haproxy.cfg"
+HAPROXY_BACKUP_FILE = HAPROXY_CONFIG_DIR / "haproxy.cfg.bak"
 HAPROXY_STATS_FILE = Path("/var/lib/vortexl2/haproxy-stats")
 HAPROXY_SOCKET = Path("/var/run/haproxy.sock")
 
@@ -159,6 +161,12 @@ defaults
         """Write HAProxy configuration to file."""
         try:
             HAPROXY_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Backup existing config if it exists and no backup yet
+            if HAPROXY_CONFIG_FILE.exists() and not HAPROXY_BACKUP_FILE.exists():
+                import shutil
+                shutil.copy2(HAPROXY_CONFIG_FILE, HAPROXY_BACKUP_FILE)
+                logger.info(f"Backed up original HAProxy config to {HAPROXY_BACKUP_FILE}")
             
             # Write with temp file for atomicity
             temp_file = HAPROXY_CONFIG_FILE.with_suffix('.cfg.tmp')
