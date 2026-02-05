@@ -238,7 +238,7 @@ def handle_forwards_menu(manager: ConfigManager):
                 ui.show_forwards_list(forwards)
         else:
             # Show config-only forwards when mode is none
-            from .haproxy_manager import HAProxyManager
+            from vortexl2.haproxy_manager import HAProxyManager
             temp_manager = HAProxyManager(config)
             forwards = temp_manager.list_forwards()
             if forwards:
@@ -253,7 +253,7 @@ def handle_forwards_menu(manager: ConfigManager):
             ports = ui.prompt_ports()
             if ports:
                 # Always use HAProxyManager to add to config (it just updates YAML)
-                from .haproxy_manager import HAProxyManager
+                from vortexl2.haproxy_manager import HAProxyManager
                 config_manager = HAProxyManager(config)
                 success, msg = config_manager.add_multiple_forwards(ports)
                 ui.show_output(msg, "Add Forwards to Config")
@@ -267,7 +267,7 @@ def handle_forwards_menu(manager: ConfigManager):
             # Remove forwards (from config)
             ports = ui.prompt_ports()
             if ports:
-                from .haproxy_manager import HAProxyManager
+                from vortexl2.haproxy_manager import HAProxyManager
                 config_manager = HAProxyManager(config)
                 success, msg = config_manager.remove_multiple_forwards(ports)
                 ui.show_output(msg, "Remove Forwards from Config")
