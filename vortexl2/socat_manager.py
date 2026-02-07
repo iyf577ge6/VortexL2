@@ -125,25 +125,32 @@ WantedBy=multi-user.target
         
         # Reload systemd and start service
         run_command("systemctl daemon-reload")
+        run_command(f"systemctl enable {service_name}")
         success, stdout, stderr = run_command(f"systemctl start {service_name}")
         
         if not success:
             self._remove_service_file(local_port)
+            run_command("systemctl daemon-reload")
             return False, f"Failed to start service: {stderr}"
         
-        # Verify port is listening
-        time.sleep(0.5)
-        if self._is_port_listening(local_port):
-            # Enable for auto-start
-            run_command(f"systemctl enable {service_name}")
+        # Wait longer for socat to start listening
+        for _ in range(6):  # Try for 3 seconds
+            time.sleep(0.5)
+            if self._is_port_listening(local_port):
+                return True, f"Socat forward started: {local_port} → {remote_ip}:{remote_port}"
+        
+        # Check if service is still running even if port check failed
+        _, status_out, _ = run_command(f"systemctl is-active {service_name}")
+        if status_out and "active" in status_out.strip():
+            # Service is running, consider it success
             return True, f"Socat forward started: {local_port} → {remote_ip}:{remote_port}"
-        else:
-            # Check service status for error
-            _, status_out, _ = run_command(f"systemctl status {service_name}")
-            run_command(f"systemctl stop {service_name}")
-            run_command(f"systemctl disable {service_name}")
-            self._remove_service_file(local_port)
-            return False, f"Socat service started but port not listening. Status: {status_out[:200] if status_out else 'unknown'}"
+        
+        # Service failed, clean up
+        run_command(f"systemctl stop {service_name}")
+        run_command(f"systemctl disable {service_name}")
+        self._remove_service_file(local_port)
+        run_command("systemctl daemon-reload")
+        return False, f"Socat service started but port not listening. Status: {status_out[:200] if status_out else 'unknown'}"
     
     def stop_forward(self, local_port: int) -> Tuple[bool, str]:
         """Stop socat forward for a specific port."""
